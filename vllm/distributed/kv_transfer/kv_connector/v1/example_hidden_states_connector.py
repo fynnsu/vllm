@@ -16,7 +16,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
-from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import HiddenStateCacheSpec
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -37,43 +38,16 @@ def extract_from_kv_cache(
 
 
 @dataclass
-class ReqMeta:
-    # Request ID
+class PendingSave:
     req_id: str
-    # Request filename
     filename: str
-    # Request tokens
     token_ids: torch.Tensor
-    # Whether this request is a new request or partially computed already
-    new_req: bool
-
-    @staticmethod
-    def make_meta(
-        req_id: str,
-        filename: str,
-        token_ids: list[int],
-        new_req: bool,
-    ) -> "ReqMeta":
-        return ReqMeta(
-            req_id=req_id,
-            filename=filename,
-            token_ids=torch.tensor(token_ids),
-            new_req=new_req,
-        )
+    block_ids: list[int]
 
 
 @dataclass
 class ExampleHiddenStatesConnectorMetadata(KVConnectorMetadata):
-    requests: list[ReqMeta] = field(default_factory=list)
-
-    def add_request(
-        self,
-        req_id: str,
-        filename: str,
-        token_ids: list[int],
-        new_req: bool = True,
-    ) -> None:
-        self.requests.append(ReqMeta.make_meta(req_id, filename, token_ids, new_req))
+    pending_saves: list[PendingSave] = field(default_factory=list)
 
 
 class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
@@ -121,9 +95,19 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             getattr(spec_config, "eagle_aux_hidden_state_layer_ids", [])
         )
 
-        self._request_filenames: dict[str, str] = {}
-        self._active_requests: dict[str, NewRequestData] = {}
-        self._req_blocks: dict[str, list[int]] = {}
+        # Find the KV cache group index for hidden states
+        self._hs_group_idx = 0
+        if kv_cache_config is not None:
+            for i, group in enumerate(kv_cache_config.kv_cache_groups):
+                if isinstance(group.kv_cache_spec, HiddenStateCacheSpec):
+                    self._hs_group_idx = i
+                    break
+
+        # Scheduler-side state
+        self._pending_saves: dict[str, PendingSave] = {}
+
+        # Worker-side state (set by register_kv_caches)
+        self._kv_cache: torch.Tensor | None = None
 
     # ==============================
     # Worker-side methods
@@ -150,6 +134,7 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         assert len(self.cache_layers) == 1, (
             f"Expected 1 CacheOnlyAttentionLayer, got {len(self.cache_layers)}"
         )
+        self._kv_cache = kv_caches[self.cache_layers[0]]
 
     def save_kv_layer(
         self,
@@ -158,47 +143,47 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         attn_metadata: AttentionMetadata,
         **kwargs: Any,
     ) -> None:
-        """Start saving the KV cache of the layer from vLLM's paged buffer
-        to the connector.
+        # Hidden states are already cached by CacheOnlyAttentionLayer during
+        # forward. Extraction happens in get_finished once all tokens are done.
+        pass
 
-        Args:
-            layer_name (str): the name of the layer.
-            kv_layer (torch.Tensor): the paged KV buffer of the current
-                layer in vLLM.
-            attn_metadata (AttentionMetadata): the attention metadata.
-            **kwargs: additional arguments for the save operation.
-        """
-        if layer_name not in self.cache_layers:
-            return
-
-        from vllm.model_executor.models.extract_hidden_states import (
-            CacheOnlyAttentionMetadata,
-        )
-
-        assert isinstance(attn_metadata, CacheOnlyAttentionMetadata), (
-            "ExampleHiddenStatesConnector only supports CacheOnlyAttentionBackend"
-        )
-
+    def get_finished(
+        self, finished_req_ids: set[str]
+    ) -> tuple[set[str] | None, set[str] | None]:
         connector_metadata = self._get_connector_metadata()
-        assert isinstance(connector_metadata, ExampleHiddenStatesConnectorMetadata)
+        if not isinstance(connector_metadata, ExampleHiddenStatesConnectorMetadata):
+            return None, None
+        if not connector_metadata.pending_saves:
+            return None, None
 
-        os.makedirs(self._storage_path, exist_ok=True)
+        assert self._kv_cache is not None
 
-        slot_mapping = attn_metadata.slot_mapping
-        offset = 0
-        for request in connector_metadata.requests:
-            num_tokens = request.token_ids.shape[0]
-            req_slot_mapping = slot_mapping[offset : offset + num_tokens]
-            offset += num_tokens
+        finished_sending: set[str] = set()
+        for pending in connector_metadata.pending_saves:
+            slots: list[int] = []
+            for block_id in pending.block_ids:
+                for offset in range(self._block_size):
+                    slots.append(block_id * self._block_size + offset)
+
+            num_tokens = pending.token_ids.shape[0]
+            slot_mapping = torch.tensor(
+                slots[:num_tokens],
+                dtype=torch.long,
+                device=self._kv_cache.device,
+            )
 
             hidden_states = extract_from_kv_cache(
-                kv_layer, req_slot_mapping, num_tokens
+                self._kv_cache, slot_mapping, num_tokens
             )
             tensors = {
                 "hidden_states": hidden_states.detach().cpu(),
-                "token_ids": request.token_ids.detach().cpu(),
+                "token_ids": pending.token_ids.detach().cpu(),
             }
-            safetensors.torch.save_file(tensors, request.filename)
+            os.makedirs(self._storage_path, exist_ok=True)
+            safetensors.torch.save_file(tensors, pending.filename)
+            finished_sending.add(pending.req_id)
+
+        return finished_sending or None, None
 
     # ==============================
     # Scheduler-side methods
@@ -246,42 +231,10 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
         meta = ExampleHiddenStatesConnectorMetadata()
-        for new_req in scheduler_output.scheduled_new_reqs:
-            token_ids = new_req.prompt_token_ids or []
-            filename = os.path.join(self._storage_path, f"{new_req.req_id}.safetensors")
-            meta.add_request(
-                new_req.req_id,
-                filename=filename,
-                token_ids=token_ids,
-            )
-            self._request_filenames[new_req.req_id] = filename
-            self._active_requests[new_req.req_id] = new_req
-            self._req_blocks[new_req.req_id] = list(new_req.block_ids[0])
 
-        cached_reqs = scheduler_output.scheduled_cached_reqs
-        for i, req_id in enumerate(cached_reqs.req_ids):
-            if req_id not in self._active_requests:
-                continue
-
-            new_block_ids = cached_reqs.new_block_ids[i]
-
-            cached_req = self._active_requests[req_id]
-            req_block_ids = self._req_blocks[req_id]
-
-            if new_block_ids is None:
-                continue
-
-            block_ids = new_block_ids[0]
-
-            req_block_ids.extend(block_ids)
-            filename = os.path.join(self._storage_path, f"{req_id}.safetensors")
-
-            meta.add_request(
-                req_id=req_id,
-                filename=filename,
-                token_ids=cached_req.prompt_token_ids or [],
-                new_req=False,
-            )
+        # Transfer pending saves into metadata (scheduler → worker bridge)
+        meta.pending_saves = list(self._pending_saves.values())
+        self._pending_saves.clear()
 
         return meta
 
@@ -294,29 +247,26 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         Called exactly once when a request has finished, before its blocks are
         freed.
 
-        The connector may assumes responsibility for freeing the blocks
-        asynchronously by returning True.
-
-        Returns:
-            True if the request is being saved/sent asynchronously and blocks
-            should not be freed until the request_id is returned from
-            get_finished().
-            Optional KVTransferParams to be included in the request outputs
-            returned by the engine.
+        Returns True to delay block freeing until get_finished extracts
+        the hidden states from the KV cache.
         """
         req_id = request.request_id
-        req_filename = self._request_filenames.pop(req_id, None)
-        _ = self._active_requests.pop(req_id, None)
-        _ = self._req_blocks.pop(req_id, None)
-
-        return False, {"hidden_states_path": req_filename}
+        filename = os.path.join(self._storage_path, f"{req_id}.safetensors")
+        token_ids = torch.tensor(request.prompt_token_ids or [])
+        self._pending_saves[req_id] = PendingSave(
+            req_id=req_id,
+            filename=filename,
+            token_ids=token_ids,
+            block_ids=list(block_ids),
+        )
+        return True, {"hidden_states_path": filename}
 
     def request_finished_all_groups(
         self,
         request: "Request",
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
-        return self.request_finished(request, block_ids[0])
+        return self.request_finished(request, block_ids[self._hs_group_idx])
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> str | None:
