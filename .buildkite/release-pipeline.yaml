@@ -120,7 +120,6 @@ steps:
 
   - label: "Generate and upload wheel indices"
     depends_on: "build-wheels"
-    allow_dependency_failure: true
     agents:
       queue: cpu_queue_release
     commands:
